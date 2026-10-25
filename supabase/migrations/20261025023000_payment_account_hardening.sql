@@ -248,6 +248,8 @@ end;
 $$;
 
 -- Scheduled/server-side cleanup helper for abandoned checkout holds.
+-- Uses the same profile -> reservation -> checkout lock order as payment_settle
+-- to avoid deadlocks with a webhook settling the same reservation.
 create function public.payment_expire_stale()
 returns integer
 language plpgsql
@@ -255,34 +257,61 @@ security definer
 set search_path = ''
 as $$
 declare
+  candidate record;
+  c public.stripe_checkouts;
   affected integer := 0;
 begin
-  with expired as (
-    update public.stripe_checkouts c
-    set state = 'expired'
-    where c.state in ('creating','open')
+  for candidate in
+    select
+      r.id as reservation_id,
+      r.instructor_id
+    from public.lesson_reservations r
+    join public.stripe_checkouts c
+      on c.reservation_id = r.id
+    where r.status = 'held'
+      and c.state in ('creating','open')
       and c.checkout_expires_at <= now()
-    returning c.reservation_id
-  ),
-  released as (
-    update public.lesson_reservations r
-    set
-      status = 'cancelled',
-      cancelled_at = coalesce(r.cancelled_at,now()),
-      cancellation_reason = coalesce(
-        r.cancellation_reason,
-        'Checkout expired'
-      )
-    where r.id in (
-      select reservation_id
-      from expired
-    )
-      and r.status = 'held'
-    returning r.id
-  )
-  select count(*)
-  into affected
-  from released;
+    order by c.checkout_expires_at, r.id
+  loop
+    perform 1
+    from public.profiles
+    where id = candidate.instructor_id
+    for update;
+
+    perform 1
+    from public.lesson_reservations
+    where id = candidate.reservation_id
+    for update;
+
+    select *
+    into c
+    from public.stripe_checkouts
+    where reservation_id = candidate.reservation_id
+    for update;
+
+    if c.reservation_id is not null
+       and c.state in ('creating','open')
+       and c.checkout_expires_at <= now() then
+      update public.stripe_checkouts
+      set state = 'expired'
+      where reservation_id = candidate.reservation_id;
+
+      update public.lesson_reservations
+      set
+        status = 'cancelled',
+        cancelled_at = coalesce(cancelled_at,now()),
+        cancellation_reason = coalesce(
+          cancellation_reason,
+          'Checkout expired'
+        )
+      where id = candidate.reservation_id
+        and status = 'held';
+
+      if found then
+        affected := affected + 1;
+      end if;
+    end if;
+  end loop;
 
   return affected;
 end;
